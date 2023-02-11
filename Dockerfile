@@ -13,4 +13,4 @@ WORKDIR /app
 COPY . .
 
 WORKDIR /app/src/raft
-RUN go test -v -run 2A -race
+RUN go test -v -run 2A -race -count 10 -timeout 200s
