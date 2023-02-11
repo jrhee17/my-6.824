@@ -13,4 +13,4 @@ WORKDIR /app
 COPY . .
 
 WORKDIR /app/src/raft
-RUN go test -v -run 2A -race -c 10
+RUN go test -v -run 2A -race -count 10
