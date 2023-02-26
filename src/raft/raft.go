@@ -556,9 +556,7 @@ func (rf *Raft) updateIndices() {
 	log.Printf("[INDICES (%v)] commit: (%v -> %v) %+v", rf.me, rf.commitIndex, newCommitIndex, rf.matchIndex)
 
 	// ensure that commit index isn't going backwards
-	if rf.commitIndex > newCommitIndex {
-		panic("commit index going backwards")
-	} else if rf.commitIndex == newCommitIndex {
+	if rf.commitIndex >= newCommitIndex {
 		// no updates
 		return
 	}
