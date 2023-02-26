@@ -14,3 +14,6 @@ COPY . .
 
 WORKDIR /app/src/raft
 RUN go test -v -run 2A -race -count 10 -timeout 200s
+RUN go test -v -run TestBasicAgree2B -race -count 10 -timeout 20s
+RUN go test -v -run TestRPCBytes2B -race -count 10 -timeout 30s
+RUN go test -v -run TestFollowerFailure2B -race -count 10 -timeout 60s

@@ -19,6 +19,8 @@ package raft
 
 import (
 	"log"
+	"sort"
+
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -238,8 +240,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.log = rf.log[:args.PrevLogIndex]
 	}
-	rf.log = append(rf.log, args.Entries...)
-	rf.commitIndex = max(rf.commitIndex, args.LeaderCommit)
+	if len(args.Entries) > 0 {
+		for i, entry := range args.Entries {
+			idx := i + args.PrevLogIndex + 1
+			if idx >= len(rf.log) {
+				rf.log = append(rf.log, entry)
+			}
+		}
+	}
+	if rf.commitIndex != args.LeaderCommit {
+		rf.commitIndex = max(rf.commitIndex, args.LeaderCommit)
+		rf.applyCommits()
+		log.Printf("[COMMITS (%v)] (%v) commitIndex: %v, lastApplied: %v", rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied)
+	}
 
 	rf.updateState(FOLLOWER, rf.currentTerm, args.Term)
 	rf.votedFor = args.LeaderId
@@ -320,7 +333,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term: rf.currentTerm,
 	})
 	rf.nextIndex[rf.me]++
+	rf.matchIndex[rf.me] = index
 
+	log.Printf("[LEADER (%v) [%v]] Start command for index: (%v) (%v)", rf.me, rf.currentTerm, index, rf.log)
 	return index, rf.currentTerm, true
 }
 
@@ -359,8 +374,6 @@ func (rf *Raft) onStateUpdate(from State, to State) {
 			rf.nextIndex[server] = len(rf.log)
 			rf.matchIndex[server] = 0
 		}
-		rf.commitIndex = 0
-		rf.lastApplied = 0
 	}
 }
 
@@ -475,17 +488,20 @@ func (rf *Raft) leaderTicker() {
 			cond := sync.NewCond(&rf.mu)
 			processed := 1
 			success := 1
-			args := AppendEntriesArgs{
-				Term:         term,
-				LeaderId:     rf.me,
-				PrevLogIndex: rf.lastLogIndex(),
-				PrevLogTerm:  rf.lastLogTerm(),
-				Entries:      nil,
-				LeaderCommit: rf.commitIndex,
-			}
 			for server, _ := range rf.peers {
 				if server == rf.me {
 					continue
+				}
+				toIdx := len(rf.log) - 1
+				lastIdx := rf.nextIndex[server] - 1
+				lastLog := rf.log[lastIdx]
+				args := AppendEntriesArgs{
+					Term:         term,
+					LeaderId:     rf.me,
+					PrevLogIndex: lastIdx,
+					PrevLogTerm:  lastLog.Term,
+					Entries:      rf.log[rf.nextIndex[server]:],
+					LeaderCommit: rf.commitIndex,
 				}
 				go func(server int) {
 					reply := AppendEntriesReply{}
@@ -498,6 +514,11 @@ func (rf *Raft) leaderTicker() {
 					}
 					if ret && reply.Success {
 						success++
+						rf.matchIndex[server] = max(rf.matchIndex[server], toIdx)
+						rf.nextIndex[server] = max(rf.nextIndex[server], toIdx+1)
+					}
+					if rf.currentTerm == term && !reply.Success {
+						rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1)
 					}
 					processed++
 					cond.Broadcast()
@@ -515,6 +536,8 @@ func (rf *Raft) leaderTicker() {
 			}
 		}
 
+		rf.updateIndices()
+
 		rf.mu.Unlock()
 		ms := 100
 		time.Sleep(time.Duration(ms) * time.Millisecond)
@@ -522,12 +545,29 @@ func (rf *Raft) leaderTicker() {
 }
 
 func (rf *Raft) updateIndices() {
-	newCommitIndex := rf.commitIndex
-	for server, _ := range rf.peers {
-		newCommitIndex = max(newCommitIndex, rf.nextIndex[server]-1)
+	sz := len(rf.matchIndex)
+	if sz == 0 {
+		return
+	}
+	tmp := make([]int, sz)
+	copy(tmp, rf.matchIndex)
+	sort.Ints(tmp)
+	newCommitIndex := tmp[sz/2]
+	log.Printf("[INDICES (%v)] commit: (%v -> %v) %+v", rf.me, rf.commitIndex, newCommitIndex, rf.matchIndex)
+
+	// ensure that commit index isn't going backwards
+	if rf.commitIndex > newCommitIndex {
+		panic("commit index going backwards")
+	} else if rf.commitIndex == newCommitIndex {
+		// no updates
+		return
 	}
 	rf.commitIndex = newCommitIndex
-	for i := rf.lastApplied + 1; i <= newCommitIndex; i++ {
+	rf.applyCommits()
+}
+
+func (rf *Raft) applyCommits() {
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := ApplyMsg{
 			CommandValid:  true,
 			Command:       rf.log[i].Data,
@@ -539,78 +579,7 @@ func (rf *Raft) updateIndices() {
 		}
 		rf.applyCh <- msg
 	}
-	rf.lastApplied = newCommitIndex
-}
-
-func (rf *Raft) logTicker() {
-	for rf.killed() == false {
-
-		rf.mu.Lock()
-
-		if rf.state == LEADER {
-			if len(rf.log) == 0 {
-				panic("log is empty")
-			}
-			term := rf.currentTerm
-			replyTerm := rf.currentTerm
-			cond := sync.NewCond(&rf.mu)
-			processed := 0
-			success := 0
-			index := rf.nextIndex[rf.me]
-			for server, _ := range rf.peers {
-				if server == rf.me || rf.nextIndex[server] == rf.nextIndex[rf.me] {
-					processed++
-					success++
-					continue
-				}
-				lastIdx := rf.nextIndex[server] - 1
-				lastLog := rf.log[lastIdx]
-				args := AppendEntriesArgs{
-					Term:         term,
-					LeaderId:     rf.me,
-					PrevLogIndex: lastIdx,
-					PrevLogTerm:  lastLog.Term,
-					Entries:      rf.log[lastIdx+1:],
-					LeaderCommit: rf.commitIndex,
-				}
-				go func(server int) {
-					reply := AppendEntriesReply{}
-					ret := rf.sendAppendEntries(server, &args, &reply)
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					defer cond.Broadcast()
-					processed++
-
-					if rf.state == LEADER && ret && reply.Term > rf.currentTerm {
-						replyTerm = reply.Term
-						return
-					}
-					if !ret {
-						return
-					}
-					if !reply.Success {
-						rf.nextIndex[server]--
-						return
-					}
-					success++
-					rf.nextIndex[server] = max(rf.nextIndex[server], index)
-				}(server)
-			}
-
-			for processed != len(rf.peers) && rf.currentTerm >= replyTerm {
-				cond.Wait()
-			}
-			if replyTerm > rf.currentTerm {
-				rf.updateState(FOLLOWER, rf.currentTerm, replyTerm)
-			} else {
-				rf.updateIndices()
-			}
-		}
-
-		rf.mu.Unlock()
-		ms := 10
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
+	rf.lastApplied = rf.commitIndex
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -635,6 +604,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.applyCh = applyCh
 	rf.log = []Log{{nil, -1}}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -642,7 +613,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.leaderTicker()
-	go rf.logTicker()
 
 	return rf
 }
