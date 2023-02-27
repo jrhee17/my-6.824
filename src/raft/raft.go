@@ -211,7 +211,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.updateState(FOLLOWER, rf.currentTerm, args.Term)
+		rf.updateState(FOLLOWER, rf.currentTerm, args.Term, "server request vote")
 	}
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
@@ -227,7 +227,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
-	rf.updateState(FOLLOWER, rf.currentTerm, args.Term)
+	rf.updateState(FOLLOWER, rf.currentTerm, args.Term, "server append entry")
 	rf.votedFor = args.LeaderId
 
 	if args.PrevLogIndex >= len(rf.log) {
@@ -379,12 +379,12 @@ func (rf *Raft) onStateUpdate(from State, to State) {
 	}
 }
 
-func (rf *Raft) updateState(state State, fromTerm int, toTerm int) bool {
+func (rf *Raft) updateState(state State, fromTerm int, toTerm int, reason string) bool {
 	if state == NONE {
 		panic("attempted to update to NONE state")
 	}
 	if rf.currentTerm == fromTerm {
-		log.Printf("[UPDATE_STATE (%v)] State: (%+v -> %+v), Term: (%v -> %v)", rf.me, rf.state, state, fromTerm, toTerm)
+		log.Printf("[UPDATE_STATE (%v)] State: (%+v -> %+v), Term: (%v -> %v), Reason: %v", rf.me, rf.state, state, fromTerm, toTerm, reason)
 		rf.onStateUpdate(rf.state, state)
 		rf.state = state
 		rf.currentTerm = toTerm
@@ -442,7 +442,7 @@ func (rf *Raft) performElection() int {
 		cond.Wait()
 	}
 	if replyTerm > rf.currentTerm {
-		rf.updateState(FOLLOWER, rf.currentTerm, replyTerm)
+		rf.updateState(FOLLOWER, rf.currentTerm, replyTerm, "client request vote")
 	}
 	return votes
 }
@@ -459,14 +459,14 @@ func (rf *Raft) ticker() {
 			votes := rf.performElection()
 			log.Printf("[VOTES (%v)] votes: %v", rf.me, votes)
 			if rf.state == CANDIDATE && votes > len(rf.peers)/2 {
-				rf.updateState(LEADER, prevTerm, prevTerm+1)
+				rf.updateState(LEADER, prevTerm, prevTerm+1, "election won")
 			} else {
-				rf.updateState(CANDIDATE, prevTerm, prevTerm+1)
+				rf.updateState(CANDIDATE, prevTerm, prevTerm+1, "election lost")
 			}
 		} else if rf.state == FOLLOWER {
 			DPrintf("[FOLLOWER (%v)]", rf.me)
 			if rf.votedFor == -1 {
-				rf.updateState(CANDIDATE, rf.currentTerm, rf.currentTerm+1)
+				rf.updateState(CANDIDATE, rf.currentTerm, rf.currentTerm+1, "election timeout")
 			}
 		}
 		rf.votedFor = -1
@@ -531,10 +531,7 @@ func (rf *Raft) leaderTicker() {
 				cond.Wait()
 			}
 			if replyTerm > rf.currentTerm {
-				rf.updateState(FOLLOWER, rf.currentTerm, replyTerm)
-			}
-			if rf.state == LEADER && success <= len(rf.peers)/2 {
-				rf.updateState(FOLLOWER, rf.currentTerm, rf.currentTerm+1)
+				rf.updateState(FOLLOWER, rf.currentTerm, replyTerm, "append client term exceeded")
 			}
 		}
 
