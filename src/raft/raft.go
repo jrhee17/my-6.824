@@ -227,24 +227,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
+	rf.updateState(FOLLOWER, rf.currentTerm, args.Term)
+	rf.votedFor = args.LeaderId
 
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
+	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		reply.Term, reply.Success = rf.currentTerm, false
+		return
+	}
 
-	prevLog := rf.log[args.PrevLogIndex]
-	if prevLog.Term != args.PrevLogTerm {
-		if args.PrevLogIndex < rf.commitIndex {
-			panic("trying to rewrite committed data")
-		}
-		rf.log = rf.log[:args.PrevLogIndex]
+	if args.PrevLogIndex < rf.commitIndex {
+		panic("trying to rewrite committed data")
 	}
 	if len(args.Entries) > 0 {
 		for i, entry := range args.Entries {
 			idx := i + args.PrevLogIndex + 1
 			if idx >= len(rf.log) {
 				rf.log = append(rf.log, entry)
+			} else {
+				rf.log[idx] = entry
 			}
 		}
 	}
@@ -254,8 +258,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		log.Printf("[COMMITS (%v)] (%v) commitIndex: %v, lastApplied: %v", rf.me, rf.currentTerm, rf.commitIndex, rf.lastApplied)
 	}
 
-	rf.updateState(FOLLOWER, rf.currentTerm, args.Term)
-	rf.votedFor = args.LeaderId
 	*reply = AppendEntriesReply{
 		Term:    args.Term,
 		Success: true,
@@ -510,14 +512,14 @@ func (rf *Raft) leaderTicker() {
 					defer rf.mu.Unlock()
 
 					if rf.state == LEADER && ret && reply.Term > rf.currentTerm {
-						replyTerm = reply.Term
+						replyTerm = max(replyTerm, reply.Term)
 					}
 					if ret && reply.Success {
 						success++
 						rf.matchIndex[server] = max(rf.matchIndex[server], toIdx)
 						rf.nextIndex[server] = max(rf.nextIndex[server], toIdx+1)
 					}
-					if rf.currentTerm == term && !reply.Success {
+					if ret && rf.currentTerm == term && !reply.Success {
 						rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1)
 					}
 					processed++
@@ -528,11 +530,11 @@ func (rf *Raft) leaderTicker() {
 			for processed != len(rf.peers) && success <= len(rf.peers)/2 && term == rf.currentTerm && rf.currentTerm >= replyTerm {
 				cond.Wait()
 			}
-			if rf.state == LEADER && success <= len(rf.peers)/2 {
-				rf.updateState(FOLLOWER, rf.currentTerm, rf.currentTerm+1)
-			}
 			if replyTerm > rf.currentTerm {
 				rf.updateState(FOLLOWER, rf.currentTerm, replyTerm)
+			}
+			if rf.state == LEADER && success <= len(rf.peers)/2 {
+				rf.updateState(FOLLOWER, rf.currentTerm, rf.currentTerm+1)
 			}
 		}
 
@@ -545,6 +547,9 @@ func (rf *Raft) leaderTicker() {
 }
 
 func (rf *Raft) updateIndices() {
+	if rf.state != LEADER {
+		return
+	}
 	sz := len(rf.matchIndex)
 	if sz == 0 {
 		return
