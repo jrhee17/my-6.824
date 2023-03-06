@@ -78,8 +78,10 @@ type Raft struct {
 	matchIndex []int
 
 	// custom
-	state         State
-	electionTimer *time.Timer
+	state            State
+	lastStateUpdated time.Time
+	electionTimer    *time.Timer
+	leaderTimer      *time.Timer
 
 	applyCh chan ApplyMsg
 }
@@ -110,6 +112,7 @@ type Log struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	Reason  string
 }
 
 // return currentTerm and whether this server
@@ -184,6 +187,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
+	Reason      string
 	// Your data here (2A).
 }
 
@@ -194,20 +198,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	log.Printf("[SERVER (%v)] (%v) %v -> %v: RequestVote(%+v)", rf.me, rf.currentTerm, args.CandidateId, rf.me, args)
 
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted, reply.Term = false, rf.currentTerm
+		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "smaller term"
 		return
 	}
 	lastLog := rf.log[len(rf.log)-1]
 	if args.LastLogTerm < lastLog.Term {
-		reply.VoteGranted, reply.Term = false, rf.currentTerm
+		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "smaller log term"
 		return
-	}
-	if args.LastLogIndex < len(rf.log)-1 {
-		reply.VoteGranted, reply.Term = false, rf.currentTerm
+	} else if args.LastLogTerm == lastLog.Term && args.LastLogIndex < len(rf.log)-1 {
+		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "smaller log index"
 		return
 	}
 	if args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
-		reply.VoteGranted, reply.Term = false, rf.currentTerm
+		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "already voted"
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -224,25 +227,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	log.Printf("[SERVER (%v)] (%v) %v -> %v: AppendEntries(%+v)", rf.me, rf.currentTerm, args.LeaderId, rf.me, args)
 
 	if rf.currentTerm > args.Term {
-		reply.Term, reply.Success = rf.currentTerm, false
+		reply.Term, reply.Success, reply.Reason = rf.currentTerm, false, "smaller term"
 		return
 	}
 	rf.updateState(FOLLOWER, rf.currentTerm, args.Term, "server append entry")
 	rf.votedFor = args.LeaderId
-
 	if args.PrevLogIndex >= len(rf.log) {
-		reply.Term, reply.Success = rf.currentTerm, false
+		reply.Term, reply.Success, reply.Reason = rf.currentTerm, false, "try again with smaller log index"
 		return
 	}
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		reply.Term, reply.Success = rf.currentTerm, false
+		reply.Term, reply.Success, reply.Reason = rf.currentTerm, false, "term differs for index"
 		return
 	}
 
-	if args.PrevLogIndex < rf.commitIndex {
-		panic("trying to rewrite committed data")
-	}
 	if len(args.Entries) > 0 {
+		if args.PrevLogIndex < rf.commitIndex {
+			panic("trying to rewrite committed data")
+		}
 		for i, entry := range args.Entries {
 			idx := i + args.PrevLogIndex + 1
 			if idx >= len(rf.log) {
@@ -388,6 +390,7 @@ func (rf *Raft) updateState(state State, fromTerm int, toTerm int, reason string
 		rf.onStateUpdate(rf.state, state)
 		rf.state = state
 		rf.currentTerm = toTerm
+		rf.lastStateUpdated = time.Now()
 		return true
 	}
 	return false
@@ -452,21 +455,21 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 
+		prevTerm := rf.currentTerm
 		if rf.state == CANDIDATE {
 			DPrintf("[CANDIDATE (%v)]", rf.me)
-			prevTerm := rf.currentTerm
 			rf.votedFor = rf.me
 			votes := rf.performElection()
 			log.Printf("[VOTES (%v)] votes: %v", rf.me, votes)
 			if rf.state == CANDIDATE && votes > len(rf.peers)/2 {
 				rf.updateState(LEADER, prevTerm, prevTerm+1, "election won")
-			} else {
+			} else if rf.state == CANDIDATE {
 				rf.updateState(CANDIDATE, prevTerm, prevTerm+1, "election lost")
 			}
 		} else if rf.state == FOLLOWER {
 			DPrintf("[FOLLOWER (%v)]", rf.me)
-			if rf.votedFor == -1 {
-				rf.updateState(CANDIDATE, rf.currentTerm, rf.currentTerm+1, "election timeout")
+			if rf.votedFor == -1 && time.Now().After(rf.lastStateUpdated.Add(time.Duration(100)*time.Millisecond)) {
+				rf.updateState(CANDIDATE, prevTerm, prevTerm+1, "election timeout")
 			}
 		}
 		rf.votedFor = -1
@@ -488,6 +491,17 @@ func (rf *Raft) leaderTicker() {
 			term := rf.currentTerm
 			replyTerm := rf.currentTerm
 			cond := sync.NewCond(&rf.mu)
+
+			rf.leaderTimer = time.NewTimer((time.Duration(50) * time.Millisecond))
+			expired := false
+			go func() {
+				<-rf.leaderTimer.C
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				expired = true
+				cond.Broadcast()
+			}()
+
 			processed := 1
 			success := 1
 			for server, _ := range rf.peers {
@@ -527,7 +541,7 @@ func (rf *Raft) leaderTicker() {
 				}(server)
 			}
 
-			for processed != len(rf.peers) && success <= len(rf.peers)/2 && term == rf.currentTerm && rf.currentTerm >= replyTerm {
+			for processed != len(rf.peers) && success <= len(rf.peers)/2 && term == rf.currentTerm && rf.currentTerm >= replyTerm && !expired {
 				cond.Wait()
 			}
 			if replyTerm > rf.currentTerm {
