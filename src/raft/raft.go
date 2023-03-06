@@ -113,6 +113,7 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	Reason  string
+	Index   int
 }
 
 // return currentTerm and whether this server
@@ -227,17 +228,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	log.Printf("[SERVER (%v)] (%v) %v -> %v: AppendEntries(%+v)", rf.me, rf.currentTerm, args.LeaderId, rf.me, args)
 
 	if rf.currentTerm > args.Term {
-		reply.Term, reply.Success, reply.Reason = rf.currentTerm, false, "smaller term"
+		reply.Term, reply.Success, reply.Index, reply.Reason = rf.currentTerm, false, -1, "smaller term"
 		return
 	}
 	rf.updateState(FOLLOWER, rf.currentTerm, args.Term, "server append entry")
 	rf.votedFor = args.LeaderId
 	if args.PrevLogIndex >= len(rf.log) {
-		reply.Term, reply.Success, reply.Reason = rf.currentTerm, false, "try again with smaller log index"
+		reply.Term, reply.Success, reply.Index, reply.Reason = rf.currentTerm, false, rf.commitIndex+1, "try again with smaller log index"
 		return
 	}
 	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
-		reply.Term, reply.Success, reply.Reason = rf.currentTerm, false, "term differs for index"
+		reply.Term, reply.Success, reply.Index, reply.Reason = rf.currentTerm, false, rf.commitIndex+1, "term differs for index"
 		return
 	}
 
@@ -263,6 +264,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	*reply = AppendEntriesReply{
 		Term:    args.Term,
 		Success: true,
+		Index:   -1,
 	}
 }
 
@@ -534,7 +536,11 @@ func (rf *Raft) leaderTicker() {
 						rf.nextIndex[server] = max(rf.nextIndex[server], toIdx+1)
 					}
 					if ret && rf.currentTerm == term && !reply.Success {
-						rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1)
+						if reply.Index >= 0 {
+							rf.nextIndex[server] = max(min(rf.nextIndex[server]-1, reply.Index), 1)
+						} else {
+							rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1)
+						}
 					}
 					processed++
 					cond.Broadcast()
