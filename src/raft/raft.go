@@ -31,6 +31,11 @@ import (
 	"6.5840/labrpc"
 )
 
+const (
+	ApplyInterval    = time.Millisecond * 100
+	ElectionInterval = time.Millisecond * 200
+)
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -186,9 +191,10 @@ type RequestVoteArgs struct {
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-	Reason      string
+	Term          int
+	VoteGranted   bool
+	Reason        string
+	IncrementTerm bool
 	// Your data here (2A).
 }
 
@@ -197,6 +203,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	log.Printf("[SERVER (%v)] (%v) %v -> %v: RequestVote(%+v)", rf.me, rf.currentTerm, args.CandidateId, rf.me, args)
+	reply.IncrementTerm = true
 
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "smaller term"
@@ -204,10 +211,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	lastLog := rf.log[len(rf.log)-1]
 	if args.LastLogTerm < lastLog.Term {
-		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "smaller log term"
+		reply.VoteGranted, reply.Term, reply.Reason, reply.IncrementTerm = false, rf.currentTerm, "smaller log term", false
 		return
 	} else if args.LastLogTerm == lastLog.Term && args.LastLogIndex < len(rf.log)-1 {
-		reply.VoteGranted, reply.Term, reply.Reason = false, rf.currentTerm, "smaller log index"
+		reply.VoteGranted, reply.Term, reply.Reason, reply.IncrementTerm = false, rf.currentTerm, "smaller log index", false
 		return
 	}
 	if args.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != args.CandidateId {
@@ -217,8 +224,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.updateState(FOLLOWER, rf.currentTerm, args.Term, "server request vote")
 	}
-	reply.VoteGranted = true
-	reply.Term = rf.currentTerm
+	reply.VoteGranted, reply.Term, reply.Reason = true, rf.currentTerm, "success"
 	rf.votedFor = args.CandidateId
 }
 
@@ -399,19 +405,19 @@ func (rf *Raft) updateState(state State, fromTerm int, toTerm int, reason string
 }
 
 // assumes that a lock is already held
-func (rf *Raft) performElection() int {
+func (rf *Raft) performElection() (int, bool) {
 	term := rf.currentTerm
-	replyTerm := rf.currentTerm
 	rf.electionTimer = time.NewTimer((time.Duration(50) * time.Millisecond))
 	expired := false
+	incTerm := true
 
 	cond := sync.NewCond(&rf.mu)
 	votes := 1
 	processed := 1
 	go func() {
-		<-rf.electionTimer.C
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		<-rf.electionTimer.C
 		expired = true
 		cond.Broadcast()
 	}()
@@ -434,22 +440,21 @@ func (rf *Raft) performElection() int {
 			if ret && reply.VoteGranted {
 				votes++
 			}
-			if reply.Term > rf.currentTerm {
-				replyTerm = reply.Term
+			if ret {
+				incTerm = incTerm && reply.IncrementTerm
+			}
+			if ret && reply.Term > rf.currentTerm {
+				rf.updateState(FOLLOWER, rf.currentTerm, reply.Term, "client request vote")
 			}
 			processed++
 			cond.Broadcast()
 		}(server)
 	}
 
-	for processed != len(rf.peers) && votes <= len(rf.peers)/2 && rf.currentTerm == term &&
-		rf.currentTerm >= replyTerm && !expired {
+	for processed != len(rf.peers) && votes <= len(rf.peers)/2 && rf.currentTerm == term && !expired {
 		cond.Wait()
 	}
-	if replyTerm > rf.currentTerm {
-		rf.updateState(FOLLOWER, rf.currentTerm, replyTerm, "client request vote")
-	}
-	return votes
+	return votes, incTerm
 }
 
 func (rf *Raft) ticker() {
@@ -461,12 +466,16 @@ func (rf *Raft) ticker() {
 		if rf.state == CANDIDATE {
 			DPrintf("[CANDIDATE (%v)]", rf.me)
 			rf.votedFor = rf.me
-			votes := rf.performElection()
+			votes, incTerm := rf.performElection()
+			nextTerm := prevTerm
+			if incTerm {
+				nextTerm++
+			}
 			log.Printf("[VOTES (%v)] votes: %v", rf.me, votes)
 			if rf.state == CANDIDATE && votes > len(rf.peers)/2 {
-				rf.updateState(LEADER, prevTerm, prevTerm+1, "election won")
+				rf.updateState(LEADER, prevTerm, nextTerm, "election won")
 			} else if rf.state == CANDIDATE {
-				rf.updateState(CANDIDATE, prevTerm, prevTerm+1, "election lost")
+				rf.updateState(CANDIDATE, prevTerm, nextTerm, "election lost")
 			}
 		} else if rf.state == FOLLOWER {
 			DPrintf("[FOLLOWER (%v)]", rf.me)
@@ -478,7 +487,7 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Unlock()
 
-		ms := 110 + (rand.Int63() % 150)
+		ms := 200 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -491,15 +500,14 @@ func (rf *Raft) leaderTicker() {
 		if rf.state == LEADER {
 			DPrintf("[LEADER (%v)]", rf.me)
 			term := rf.currentTerm
-			replyTerm := rf.currentTerm
 			cond := sync.NewCond(&rf.mu)
 
 			rf.leaderTimer = time.NewTimer((time.Duration(50) * time.Millisecond))
 			expired := false
 			go func() {
-				<-rf.leaderTimer.C
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				<-rf.leaderTimer.C
 				expired = true
 				cond.Broadcast()
 			}()
@@ -513,12 +521,16 @@ func (rf *Raft) leaderTicker() {
 				toIdx := len(rf.log) - 1
 				lastIdx := rf.nextIndex[server] - 1
 				lastLog := rf.log[lastIdx]
+				// copy the logs so that serialization can be done without locking
+				logs := rf.log[rf.nextIndex[server]:]
+				tmp_logs := make([]Log, len(logs))
+				copy(tmp_logs, logs)
 				args := AppendEntriesArgs{
 					Term:         term,
 					LeaderId:     rf.me,
 					PrevLogIndex: lastIdx,
 					PrevLogTerm:  lastLog.Term,
-					Entries:      rf.log[rf.nextIndex[server]:],
+					Entries:      tmp_logs,
 					LeaderCommit: rf.commitIndex,
 				}
 				go func(server int) {
@@ -527,8 +539,10 @@ func (rf *Raft) leaderTicker() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 
-					if rf.state == LEADER && ret && reply.Term > rf.currentTerm {
-						replyTerm = max(replyTerm, reply.Term)
+					if ret {
+						if reply.Term > rf.currentTerm {
+							rf.updateState(FOLLOWER, rf.currentTerm, reply.Term, "append client term exceeded")
+						}
 					}
 					if ret && reply.Success {
 						success++
@@ -547,19 +561,15 @@ func (rf *Raft) leaderTicker() {
 				}(server)
 			}
 
-			for processed != len(rf.peers) && success <= len(rf.peers)/2 && term == rf.currentTerm && rf.currentTerm >= replyTerm && !expired {
+			for processed != len(rf.peers) && success <= len(rf.peers)/2 && term == rf.currentTerm && !expired {
 				cond.Wait()
-			}
-			if replyTerm > rf.currentTerm {
-				rf.updateState(FOLLOWER, rf.currentTerm, replyTerm, "append client term exceeded")
 			}
 		}
 
 		rf.updateIndices()
 
 		rf.mu.Unlock()
-		ms := 100
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(ApplyInterval)
 	}
 }
 
